@@ -22,7 +22,7 @@ import (
 
 const (
 	defaultPort           = "9933"
-	defaultMinRateSeconds = 86400 // 24 hours
+	defaultMinRateSeconds = 86400
 	redditTokenURL        = "https://www.reddit.com/api/v1/access_token"
 	redditOAuthBase       = "https://oauth.reddit.com"
 	defaultFetchLimit     = 100
@@ -93,6 +93,24 @@ type redditPost struct {
 	GalleryData         *galleryData             `json:"gallery_data"`
 	MediaMetadata       map[string]mediaMetadata `json:"media_metadata"`
 	Preview             *previewData             `json:"preview"`
+	Media               *redditMedia             `json:"media"`
+	SecureMedia         *redditMedia             `json:"secure_media"`
+}
+
+type redditMedia struct {
+	RedditVideo *redditVideo `json:"reddit_video"`
+}
+
+type redditVideo struct {
+	FallbackURL       string `json:"fallback_url"`
+	HLSURL            string `json:"hls_url"`
+	DASHURL           string `json:"dash_url"`
+	ScrubberMediaURL  string `json:"scrubber_media_url"`
+	Width             int    `json:"width"`
+	Height            int    `json:"height"`
+	Duration          int    `json:"duration"`
+	IsGIF             bool   `json:"is_gif"`
+	TranscodingStatus string `json:"transcoding_status"`
 }
 
 type galleryData struct {
@@ -125,10 +143,26 @@ type previewData struct {
 	} `json:"images"`
 }
 
+type mediaKind string
+
+const (
+	mediaKindImage mediaKind = "image"
+	mediaKindVideo mediaKind = "video"
+)
+
+type mediaItem struct {
+	Kind        mediaKind
+	URL         string
+	PosterURL   string
+	FallbackURL string
+	Width       int
+	Height      int
+}
+
 type feedItem struct {
 	Title     string
-	ImageURL  string
-	Link      string
+	Media     mediaItem
+	Permalink string
 	GUID      string
 	CreatedAt time.Time
 }
@@ -164,7 +198,7 @@ func main() {
 		clientID:     clientID,
 		clientSecret: clientSecret,
 		minRate:      time.Duration(minRateSeconds) * time.Second,
-		userAgent:    "linux:rssedit:v0.2 by /u/codabool",
+		userAgent:    "linux:rssedit:v0.3 by /u/codabool",
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -223,7 +257,6 @@ func (a *app) handleFeed(w http.ResponseWriter, r *http.Request) {
 func (a *app) getFeedXML(ctx context.Context, user string) (feedResult, error) {
 	now := time.Now()
 
-	// Fast path: fresh cache.
 	a.mu.Lock()
 	if entry, ok := a.cache[user]; ok && now.Sub(entry.fetchedAt) < a.minRate {
 		a.mu.Unlock()
@@ -234,7 +267,6 @@ func (a *app) getFeedXML(ctx context.Context, user string) (feedResult, error) {
 		}, nil
 	}
 
-	// If another request is already refreshing this user, wait for it.
 	if ch, ok := a.inFlight[user]; ok {
 		a.mu.Unlock()
 
@@ -259,16 +291,14 @@ func (a *app) getFeedXML(ctx context.Context, user string) (feedResult, error) {
 		return feedResult{}, errors.New("refresh completed but no cache entry was created")
 	}
 
-	// Mark this user as currently refreshing.
 	ch := make(chan struct{})
 	a.inFlight[user] = ch
 
-	// Keep stale cache handy in case Reddit errors.
 	staleEntry, hasStale := a.cache[user]
 
 	a.mu.Unlock()
 
-	items, err := a.fetchImageItems(ctx, user)
+	items, err := a.fetchMediaItems(ctx, user)
 
 	a.mu.Lock()
 	delete(a.inFlight, user)
@@ -318,7 +348,7 @@ func (a *app) getFeedXML(ctx context.Context, user string) (feedResult, error) {
 	}, nil
 }
 
-func (a *app) fetchImageItems(ctx context.Context, user string) ([]feedItem, error) {
+func (a *app) fetchMediaItems(ctx context.Context, user string) ([]feedItem, error) {
 	token, err := a.getAccessToken(ctx)
 	if err != nil {
 		return nil, err
@@ -372,30 +402,32 @@ func (a *app) fetchImageItems(ctx context.Context, user string) ([]feedItem, err
 			continue
 		}
 
-		img := bestImageURL(p)
-		if img == "" {
+		media := bestMedia(p)
+		if media.URL == "" {
 			continue
 		}
 
 		seenTitles[titleKey] = true
 
-		link := p.URL
+		permalink := ""
 		if p.Permalink != "" {
-			link = "https://www.reddit.com" + p.Permalink
+			permalink = "https://www.reddit.com" + p.Permalink
+		} else if p.URL != "" {
+			permalink = p.URL
 		}
 
-		guid := p.Name
+		guid := permalink
 		if guid == "" {
-			guid = p.ID
+			guid = p.Name
 		}
 		if guid == "" {
-			guid = link
+			guid = p.ID
 		}
 
 		items = append(items, feedItem{
 			Title:     p.Title,
-			ImageURL:  img,
-			Link:      link,
+			Media:     media,
+			Permalink: permalink,
 			GUID:      guid,
 			CreatedAt: unixUTC(p.CreatedUTC),
 		})
@@ -462,13 +494,36 @@ func (a *app) getAccessToken(ctx context.Context) (string, error) {
 	return tr.AccessToken, nil
 }
 
-func bestImageURL(p redditPost) string {
-	// Reject obvious non-image/self/video posts.
-	if p.IsSelf || p.IsVideo {
-		return ""
+func bestMedia(p redditPost) mediaItem {
+	// Drop text posts.
+	if p.IsSelf {
+		return mediaItem{}
 	}
 
-	// Reddit gallery: use the first valid image in gallery order.
+	// Reddit-hosted video.
+	if video := bestRedditVideo(p); video != nil {
+		poster := bestPreviewPoster(p)
+
+		videoURL := cleanURL(video.HLSURL)
+		if videoURL == "" {
+			videoURL = cleanURL(video.FallbackURL)
+		}
+
+		if videoURL == "" {
+			return mediaItem{}
+		}
+
+		return mediaItem{
+			Kind:        mediaKindVideo,
+			URL:         videoURL,
+			PosterURL:   poster,
+			FallbackURL: cleanURL(video.FallbackURL),
+			Width:       video.Width,
+			Height:      video.Height,
+		}
+	}
+
+	// Reddit gallery: use first valid image.
 	if p.GalleryData != nil && len(p.GalleryData.Items) > 0 && len(p.MediaMetadata) > 0 {
 		for _, item := range p.GalleryData.Items {
 			if item.IsDeleted || item.MediaID == "" {
@@ -489,27 +544,67 @@ func bestImageURL(p redditPost) string {
 			}
 
 			if meta.S.URL != "" {
-				return cleanURL(meta.S.URL)
+				return mediaItem{
+					Kind:   mediaKindImage,
+					URL:    cleanURL(meta.S.URL),
+					Width:  meta.S.X,
+					Height: meta.S.Y,
+				}
 			}
 		}
 	}
 
-	// Direct i.redd.it image posts.
+	// Direct image / gif.
 	direct := p.URLOverriddenByDest
 	if direct == "" {
 		direct = p.URL
 	}
 
 	if isImageLikeURL(direct) {
-		return cleanURL(direct)
+		return mediaItem{
+			Kind: mediaKindImage,
+			URL:  cleanURL(direct),
+		}
 	}
 
-	// Reddit preview fallback.
+	// Reddit preview fallback for image posts.
 	if p.PostHint == "image" && p.Preview != nil && len(p.Preview.Images) > 0 {
+		src := p.Preview.Images[0].Source.URL
+		if src != "" {
+			return mediaItem{
+				Kind:   mediaKindImage,
+				URL:    cleanURL(src),
+				Width:  p.Preview.Images[0].Source.Width,
+				Height: p.Preview.Images[0].Source.Height,
+			}
+		}
+	}
+
+	return mediaItem{}
+}
+
+func bestRedditVideo(p redditPost) *redditVideo {
+	if p.SecureMedia != nil && p.SecureMedia.RedditVideo != nil {
+		return p.SecureMedia.RedditVideo
+	}
+
+	if p.Media != nil && p.Media.RedditVideo != nil {
+		return p.Media.RedditVideo
+	}
+
+	return nil
+}
+
+func bestPreviewPoster(p redditPost) string {
+	if p.Preview != nil && len(p.Preview.Images) > 0 {
 		src := p.Preview.Images[0].Source.URL
 		if src != "" {
 			return cleanURL(src)
 		}
+	}
+
+	if p.URL != "" && isImageLikeURL(p.URL) {
+		return cleanURL(p.URL)
 	}
 
 	return ""
@@ -544,26 +639,37 @@ func buildRSS(user string, items []feedItem) ([]byte, error) {
 	buf.WriteString(`<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">`)
 	buf.WriteString("<channel>")
 
-	writeElem(&buf, "title", "reddit images - u/"+user)
+	writeElem(&buf, "title", "reddit media - u/"+user)
 	writeElem(&buf, "link", "https://www.reddit.com/user/"+user+"/submitted/")
-	writeElem(&buf, "description", "Image posts from u/"+user)
+	writeElem(&buf, "description", "Image and video posts from u/"+user)
 	writeElem(&buf, "ttl", "1440")
 	writeElem(&buf, "lastBuildDate", time.Now().UTC().Format(time.RFC1123Z))
 
 	for _, item := range items {
 		buf.WriteString("<item>")
-		writeElem(&buf, "title", item.Title)
-		writeElem(&buf, "link", item.Link)
-		writeElem(&buf, "guid", item.GUID)
-		writeElem(&buf, "pubDate", item.CreatedAt.UTC().Format(time.RFC1123Z))
 
-		// Keep content minimal: just the image.
-		content := fmt.Sprintf(`<img src="%s" alt="%s">`, xmlEscape(item.ImageURL), xmlEscape(item.Title))
-		writeElem(&buf, "description", content)
+		// Like your example: link points directly to media.
+		writeElem(&buf, "link", item.MediaLink())
+
+		writeElem(&buf, "title", item.DisplayTitle())
+
+		buf.WriteString(`<guid isPermaLink="true">`)
+		buf.WriteString(xmlEscape(item.GUID))
+		buf.WriteString("</guid>")
+
+		if item.Permalink != "" {
+			writeElem(&buf, "comments", item.Permalink)
+		}
+
+		buf.WriteString("<description><![CDATA[")
+		buf.WriteString(item.DescriptionHTML())
+		buf.WriteString("]]></description>")
 
 		buf.WriteString("<content:encoded><![CDATA[")
-		buf.WriteString(content)
+		buf.WriteString(item.DescriptionHTML())
 		buf.WriteString("]]></content:encoded>")
+
+		writeElem(&buf, "pubDate", item.CreatedAt.UTC().Format(time.RFC1123Z))
 
 		buf.WriteString("</item>")
 	}
@@ -571,6 +677,116 @@ func buildRSS(user string, items []feedItem) ([]byte, error) {
 	buf.WriteString("</channel></rss>")
 
 	return buf.Bytes(), nil
+}
+
+func (i feedItem) MediaLink() string {
+	if i.Media.Kind == mediaKindVideo && i.Media.FallbackURL != "" {
+		// Keep <link> on v.redd.it-ish / MP4-ish media when available.
+		return i.Media.FallbackURL
+	}
+
+	return i.Media.URL
+}
+
+func (i feedItem) DisplayTitle() string {
+	switch i.Media.Kind {
+	case mediaKindVideo:
+		return i.Title + " (Video)"
+	case mediaKindImage:
+		return i.Title
+	default:
+		return i.Title
+	}
+}
+
+func (i feedItem) DescriptionHTML() string {
+	var buf strings.Builder
+
+	if i.Permalink != "" {
+		buf.WriteString("<section class='reading-time-and-permalink'>")
+		buf.WriteString("<p><a href='")
+		buf.WriteString(htmlAttr(i.Permalink))
+		buf.WriteString("'>Post permalink</a></p>")
+		buf.WriteString("</section>")
+	}
+
+	switch i.Media.Kind {
+	case mediaKindVideo:
+		buf.WriteString("<section class='embedded-media'>")
+		buf.WriteString("<video controls preload='metadata' playsinline")
+
+		if i.Media.PosterURL != "" {
+			buf.WriteString(" poster='")
+			buf.WriteString(htmlAttr(i.Media.PosterURL))
+			buf.WriteString("'")
+		}
+
+		buf.WriteString(">")
+
+		if i.Media.URL != "" {
+			buf.WriteString("<source src='")
+			buf.WriteString(htmlAttr(i.Media.URL))
+			buf.WriteString("' type='")
+			if strings.Contains(strings.ToLower(i.Media.URL), ".m3u8") {
+				buf.WriteString("application/x-mpegURL")
+			} else {
+				buf.WriteString("video/mp4")
+			}
+			buf.WriteString("'")
+
+			if i.Media.Width > 0 {
+				buf.WriteString(" width='")
+				buf.WriteString(strconv.Itoa(i.Media.Width))
+				buf.WriteString("'")
+			}
+
+			if i.Media.Height > 0 {
+				buf.WriteString(" height='")
+				buf.WriteString(strconv.Itoa(i.Media.Height))
+				buf.WriteString("'")
+			}
+
+			buf.WriteString(">")
+		}
+
+		if i.Media.FallbackURL != "" && i.Media.FallbackURL != i.Media.URL {
+			buf.WriteString("<source src='")
+			buf.WriteString(htmlAttr(i.Media.FallbackURL))
+			buf.WriteString("' type='video/mp4'")
+
+			if i.Media.Width > 0 {
+				buf.WriteString(" width='")
+				buf.WriteString(strconv.Itoa(i.Media.Width))
+				buf.WriteString("'")
+			}
+
+			if i.Media.Height > 0 {
+				buf.WriteString(" height='")
+				buf.WriteString(strconv.Itoa(i.Media.Height))
+				buf.WriteString("'")
+			}
+
+			buf.WriteString(">")
+		}
+
+		if i.Media.PosterURL != "" {
+			buf.WriteString("<img src='")
+			buf.WriteString(htmlAttr(i.Media.PosterURL))
+			buf.WriteString("' alt='' />")
+		}
+
+		buf.WriteString("</video>")
+		buf.WriteString("</section>")
+
+	case mediaKindImage:
+		buf.WriteString("<section class='preview-image'>")
+		buf.WriteString("<img src='")
+		buf.WriteString(htmlAttr(i.Media.URL))
+		buf.WriteString("' />")
+		buf.WriteString("</section>")
+	}
+
+	return buf.String()
 }
 
 func writeElem(buf *bytes.Buffer, name string, value string) {
@@ -587,6 +803,10 @@ func xmlEscape(s string) string {
 	var buf bytes.Buffer
 	_ = xml.EscapeText(&buf, []byte(s))
 	return buf.String()
+}
+
+func htmlAttr(s string) string {
+	return html.EscapeString(strings.TrimSpace(s))
 }
 
 func normalizeTitle(s string) string {
