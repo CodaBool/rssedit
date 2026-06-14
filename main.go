@@ -21,12 +21,12 @@ import (
 )
 
 const (
-	defaultPort          = "9933"
-	defaultPollSeconds   = 3600
-	redditTokenURL       = "https://www.reddit.com/api/v1/access_token"
-	redditOAuthBase      = "https://oauth.reddit.com"
-	defaultFetchLimit    = 100
-	defaultCacheCapacity = 256
+	defaultPort           = "9933"
+	defaultMinRateSeconds = 86400 // 24 hours
+	redditTokenURL        = "https://www.reddit.com/api/v1/access_token"
+	redditOAuthBase       = "https://oauth.reddit.com"
+	defaultFetchLimit     = 100
+	defaultCacheCapacity  = 256
 )
 
 var imageExtRE = regexp.MustCompile(`(?i)\.(jpg|jpeg|png|webp|gif)(\?|$)`)
@@ -34,7 +34,7 @@ var imageExtRE = regexp.MustCompile(`(?i)\.(jpg|jpeg|png|webp|gif)(\?|$)`)
 type app struct {
 	clientID     string
 	clientSecret string
-	pollInterval time.Duration
+	minRate      time.Duration
 	userAgent    string
 	httpClient   *http.Client
 
@@ -42,11 +42,18 @@ type app struct {
 	token       string
 	tokenExpiry time.Time
 	cache       map[string]cacheEntry
+	inFlight    map[string]chan struct{}
 }
 
 type cacheEntry struct {
 	xml       []byte
 	fetchedAt time.Time
+}
+
+type feedResult struct {
+	xml        []byte
+	cacheState string
+	fetchedAt  time.Time
 }
 
 type redditTokenResponse struct {
@@ -137,10 +144,15 @@ func main() {
 		log.Fatal("missing REDDIT_CLIENT_SECRET")
 	}
 
-	pollSeconds := envInt("POLL_INTERVAL_IN_SECONDS", defaultPollSeconds)
-	if pollSeconds < 60 {
-		log.Printf("POLL_INTERVAL_IN_SECONDS=%d is pretty aggressive; forcing minimum 60 seconds", pollSeconds)
-		pollSeconds = 60
+	minRateSeconds := envIntWithLegacy(
+		"MIN_RATE_IN_SECONDS",
+		"POLL_INTERVAL_IN_SECONDS",
+		defaultMinRateSeconds,
+	)
+
+	if minRateSeconds < 60 {
+		log.Printf("MIN_RATE_IN_SECONDS=%d is very aggressive; forcing minimum 60 seconds", minRateSeconds)
+		minRateSeconds = 60
 	}
 
 	port := strings.TrimSpace(os.Getenv("PORT"))
@@ -151,12 +163,13 @@ func main() {
 	a := &app{
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		pollInterval: time.Duration(pollSeconds) * time.Second,
-		userAgent:    "linux:rssedit:v0.1 by /u/codabool",
+		minRate:      time.Duration(minRateSeconds) * time.Second,
+		userAgent:    "linux:rssedit:v0.2 by /u/codabool",
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		cache: make(map[string]cacheEntry, defaultCacheCapacity),
+		cache:    make(map[string]cacheEntry, defaultCacheCapacity),
+		inFlight: make(map[string]chan struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -168,7 +181,7 @@ func main() {
 
 	addr := ":" + port
 	log.Printf("rssedit listening on %s", addr)
-	log.Printf("cache/poll interval: %s", a.pollInterval)
+	log.Printf("minimum Reddit fetch interval per user: %s", a.minRate)
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
@@ -192,9 +205,7 @@ func (a *app) handleFeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-
-	feedXML, err := a.getFeedXML(ctx, user)
+	result, err := a.getFeedXML(r.Context(), user)
 	if err != nil {
 		log.Printf("feed error for user=%s: %v", user, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -202,40 +213,109 @@ func (a *app) handleFeed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
-	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(a.pollInterval.Seconds())))
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(a.minRate.Seconds())))
+	w.Header().Set("X-Rssedit-Cache", result.cacheState)
+	w.Header().Set("X-Rssedit-Fetched-At", result.fetchedAt.UTC().Format(time.RFC3339))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(feedXML)
+	_, _ = w.Write(result.xml)
 }
 
-func (a *app) getFeedXML(ctx context.Context, user string) ([]byte, error) {
+func (a *app) getFeedXML(ctx context.Context, user string) (feedResult, error) {
 	now := time.Now()
 
+	// Fast path: fresh cache.
 	a.mu.Lock()
-	if entry, ok := a.cache[user]; ok && now.Sub(entry.fetchedAt) < a.pollInterval {
-		out := entry.xml
+	if entry, ok := a.cache[user]; ok && now.Sub(entry.fetchedAt) < a.minRate {
 		a.mu.Unlock()
-		return out, nil
+		return feedResult{
+			xml:        entry.xml,
+			cacheState: "HIT",
+			fetchedAt:  entry.fetchedAt,
+		}, nil
 	}
+
+	// If another request is already refreshing this user, wait for it.
+	if ch, ok := a.inFlight[user]; ok {
+		a.mu.Unlock()
+
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return feedResult{}, ctx.Err()
+		}
+
+		a.mu.Lock()
+		entry, ok := a.cache[user]
+		a.mu.Unlock()
+
+		if ok {
+			return feedResult{
+				xml:        entry.xml,
+				cacheState: "HIT-AFTER-WAIT",
+				fetchedAt:  entry.fetchedAt,
+			}, nil
+		}
+
+		return feedResult{}, errors.New("refresh completed but no cache entry was created")
+	}
+
+	// Mark this user as currently refreshing.
+	ch := make(chan struct{})
+	a.inFlight[user] = ch
+
+	// Keep stale cache handy in case Reddit errors.
+	staleEntry, hasStale := a.cache[user]
+
 	a.mu.Unlock()
 
 	items, err := a.fetchImageItems(ctx, user)
+
+	a.mu.Lock()
+	delete(a.inFlight, user)
+	close(ch)
+	a.mu.Unlock()
+
 	if err != nil {
-		return nil, err
+		if hasStale {
+			log.Printf("reddit fetch failed for user=%s; serving stale cache: %v", user, err)
+			return feedResult{
+				xml:        staleEntry.xml,
+				cacheState: "STALE-ERROR",
+				fetchedAt:  staleEntry.fetchedAt,
+			}, nil
+		}
+
+		return feedResult{}, err
 	}
 
 	feedXML, err := buildRSS(user, items)
 	if err != nil {
-		return nil, err
+		if hasStale {
+			log.Printf("rss build failed for user=%s; serving stale cache: %v", user, err)
+			return feedResult{
+				xml:        staleEntry.xml,
+				cacheState: "STALE-BUILD-ERROR",
+				fetchedAt:  staleEntry.fetchedAt,
+			}, nil
+		}
+
+		return feedResult{}, err
 	}
+
+	fetchedAt := time.Now()
 
 	a.mu.Lock()
 	a.cache[user] = cacheEntry{
 		xml:       feedXML,
-		fetchedAt: now,
+		fetchedAt: fetchedAt,
 	}
 	a.mu.Unlock()
 
-	return feedXML, nil
+	return feedResult{
+		xml:        feedXML,
+		cacheState: "MISS",
+		fetchedAt:  fetchedAt,
+	}, nil
 }
 
 func (a *app) fetchImageItems(ctx context.Context, user string) ([]feedItem, error) {
@@ -414,7 +494,7 @@ func bestImageURL(p redditPost) string {
 		}
 	}
 
-	// Direct i.redd.it image posts are the best case.
+	// Direct i.redd.it image posts.
 	direct := p.URLOverriddenByDest
 	if direct == "" {
 		direct = p.URL
@@ -424,7 +504,7 @@ func bestImageURL(p redditPost) string {
 		return cleanURL(direct)
 	}
 
-	// Reddit sometimes gives full-size-ish preview source URLs.
+	// Reddit preview fallback.
 	if p.PostHint == "image" && p.Preview != nil && len(p.Preview.Images) > 0 {
 		src := p.Preview.Images[0].Source.URL
 		if src != "" {
@@ -467,7 +547,7 @@ func buildRSS(user string, items []feedItem) ([]byte, error) {
 	writeElem(&buf, "title", "reddit images - u/"+user)
 	writeElem(&buf, "link", "https://www.reddit.com/user/"+user+"/submitted/")
 	writeElem(&buf, "description", "Image posts from u/"+user)
-	writeElem(&buf, "ttl", "60")
+	writeElem(&buf, "ttl", "1440")
 	writeElem(&buf, "lastBuildDate", time.Now().UTC().Format(time.RFC1123Z))
 
 	for _, item := range items {
@@ -477,7 +557,7 @@ func buildRSS(user string, items []feedItem) ([]byte, error) {
 		writeElem(&buf, "guid", item.GUID)
 		writeElem(&buf, "pubDate", item.CreatedAt.UTC().Format(time.RFC1123Z))
 
-		// Keep content minimal: just an image.
+		// Keep content minimal: just the image.
 		content := fmt.Sprintf(`<img src="%s" alt="%s">`, xmlEscape(item.ImageURL), xmlEscape(item.Title))
 		writeElem(&buf, "description", content)
 
@@ -538,8 +618,16 @@ func validRedditUser(user string) bool {
 	return true
 }
 
-func envInt(name string, fallback int) int {
+func envIntWithLegacy(name string, legacyName string, fallback int) int {
 	raw := strings.TrimSpace(os.Getenv(name))
+
+	if raw == "" && legacyName != "" {
+		raw = strings.TrimSpace(os.Getenv(legacyName))
+		if raw != "" {
+			log.Printf("%s is deprecated; use %s instead", legacyName, name)
+		}
+	}
+
 	if raw == "" {
 		return fallback
 	}
